@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import streamlit as st
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.config import settings
 from src.db import postgres, neo4j_conn
-from src.ingestion.embedder import get_embedder
 from src.ingestion.ingest import (
     ingest_pdf,
     list_ingested_documents,
     delete_document,
 )
 from src.graph.writer import get_graph_stats, query_entity_neighborhood
+from src.retrieval.router import retrieve_and_answer
 
 # Ensure schemas are ready
 postgres.init_schema()
@@ -172,60 +170,48 @@ with tab1:
         )
 
         if st.button("Search & Answer", type="primary", disabled=not question.strip()):
-            with st.spinner("Embedding query and searching pgvector..."):
-                embedder = get_embedder()
-                query_embedding = embedder.embed_query(question.strip())
-
-                # Vector search using HNSW cosine index
-                filter_ids = selected_doc_ids if selected_doc_ids else None
-                matches = postgres.vector_search(
-                    query_embedding=query_embedding,
-                    top_k=settings.top_k,
-                    doc_ids=filter_ids,
+            with st.spinner("Routing question and retrieving evidence..."):
+                result = retrieve_and_answer(
+                    question.strip(),
+                    doc_ids=selected_doc_ids or None,
+                    documents=docs,
                 )
 
-            if not matches:
-                st.warning("No relevant passages found in the knowledge base.")
-            else:
-                passages = []
-                for m in matches:
-                    doc_name = next((d["filename"] for d in docs if d["id"] == m["doc_id"]), f"Doc #{m['doc_id']}")
-                    passages.append(
-                        f"[{doc_name} | Page {m['page_number']} | Chunk {m['chunk_index']}]:\n{m['text']}"
+            decision = result["decision"]
+            fallback_label = " (low-confidence fallback)" if decision.fallback else ""
+            st.caption(
+                f"Route: {decision.route.value} | Confidence: {decision.confidence:.2f}"
+                f"{fallback_label} | {result['latency_ms']:.0f} ms | "
+                f"Citation retries: {result['generation'].retries}"
+            )
+            st.subheader("💡 Answer")
+            if result["generation"].extractive_fallback:
+                st.info("The generated answer failed citation checks. Showing verified source text instead.")
+            st.write(result["answer"])
+
+            vector_matches = result["vector_results"]
+            graph_matches = result["graph_results"]
+            if not vector_matches and not graph_matches:
+                st.warning("No relevant evidence found in the selected documents.")
+
+            if vector_matches:
+                st.subheader("🔍 Vector Evidence")
+                for idx, match in enumerate(vector_matches, 1):
+                    doc_name = next(
+                        (doc["filename"] for doc in docs if doc["id"] == match["doc_id"]),
+                        f"Doc #{match['doc_id']}",
                     )
-                context_str = "\n\n---\n\n".join(passages)
+                    score_pct = round(float(match["score"]) * 100, 1)
+                    with st.expander(
+                        f"#{idx} | {doc_name} (Page {match['page_number']}) — Similarity: {score_pct}%"
+                    ):
+                        st.write(match["text"])
 
-                with st.spinner("Generating answer with Ollama..."):
-                    try:
-                        chat_model = ChatOllama(
-                            base_url=settings.ollama_base_url,
-                            model=settings.ollama_chat_model,
-                            temperature=0,
-                        )
-                        completion = chat_model.invoke(
-                            [
-                                SystemMessage(
-                                    content=(
-                                        "You are an expert AI knowledge assistant. Answer the user's question "
-                                        "strictly using the provided excerpts. Cite source documents and pages "
-                                        "using the format [Filename, Page N]. If the passages do not contain "
-                                        "the information, clearly state that."
-                                    )
-                                ),
-                                HumanMessage(content=f"Context Passages:\n{context_str}\n\nQuestion: {question}"),
-                            ]
-                        )
-                        answer = str(completion.content)
-                    except Exception as err:
-                        answer = f"Error querying LLM: {err}"
-
-                st.subheader("💡 Answer")
-                st.write(answer)
-
-                st.subheader("🔍 Retrieved Passages (pgvector HNSW)")
-                for idx, m in enumerate(matches, 1):
-                    doc_name = next((d["filename"] for d in docs if d["id"] == m["doc_id"]), f"Doc #{m['doc_id']}")
-                    score_pct = round(float(m["score"]) * 100, 1)
-                    with st.expander(f"#{idx} | {doc_name} (Page {m['page_number']}) — Similarity: {score_pct}%"):
-                        st.markdown(f"**Chunk Index:** {m['chunk_index']} | **Doc ID:** {m['doc_id']}")
-                        st.write(m["text"])
+            if graph_matches:
+                st.subheader("🕸️ Graph Evidence")
+                for idx, match in enumerate(graph_matches, 1):
+                    st.write(f"{idx}. {match['text']}")
+                    st.caption(
+                        f"{match.get('source', 'graph').upper()} | "
+                        f"Doc #{match.get('doc_id')} | Chunk {match.get('source_chunk_id')}"
+                    )

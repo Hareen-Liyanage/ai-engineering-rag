@@ -32,6 +32,12 @@ class Settings:
     llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama"))
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    llm_fallback_enabled: bool = field(
+        default_factory=lambda: os.getenv("LLM_FALLBACK_ENABLED", "false").lower() in {"1", "true", "yes"}
+    )
+    llm_fallback_provider: str = field(
+        default_factory=lambda: os.getenv("LLM_FALLBACK_PROVIDER", "anthropic").lower()
+    )
 
     # ── Ollama (local dev) ───────────────────────────────────────────────────
     ollama_base_url: str = field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
@@ -49,6 +55,9 @@ class Settings:
     # ── Retrieval ────────────────────────────────────────────────────────────
     top_k: int = field(default_factory=lambda: int(os.getenv("TOP_K", "5")))
     embedding_dim: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_DIM", "768")))  # nomic-embed-text
+    route_confidence_threshold: float = field(
+        default_factory=lambda: float(os.getenv("ROUTE_CONFIDENCE_THRESHOLD", "0.65"))
+    )
 
     @property
     def pg_dsn(self) -> str:

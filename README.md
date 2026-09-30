@@ -136,6 +136,21 @@ Run Phase 3 (Entity extraction & Neo4j graph) end-to-end test:
 python test_phase3.py
 ```
 
+Run Phase 4 retrieval unit tests (no database or model services required):
+```powershell
+& .\.venv\Scripts\python.exe -m unittest test_phase4
+```
+
+Run Phase 5 citation validation and generation tests:
+```powershell
+& .\.venv\Scripts\python.exe -m unittest test_phase5
+```
+
+Run both suites together:
+```powershell
+& .\.venv\Scripts\python.exe -m unittest test_phase4 test_phase5
+```
+
 ---
 
 ## Launch the Application
@@ -153,6 +168,30 @@ Open your browser at `http://localhost:8501`.
 - [x] **Phase 1 — Infrastructure:** PostgreSQL + pgvector, Neo4j, Ollama, schema initialization, and smoke test.
 - [x] **Phase 2 — Ingestion & Vector Search:** Rich chunking with page provenance, SHA-256 idempotency, batched embedding, and pgvector HNSW search.
 - [x] **Phase 3 — Knowledge Graph Construction:** Domain ontology, LLM entity & relation extraction, canonical resolution, Neo4j graph writing with chunk provenance, and graph explorer UI.
-- [ ] **Phase 4 — Query Router & Hybrid Retrieval:** Query intent classifier (`vector`, `graph`, `both`), path-to-prose conversion, and fused context generation.
-- [ ] **Phase 5 — Evaluation & Benchmarking:** Automated multi-hop test set evaluation (RAGAS / TruLens) comparing pure vector vs. hybrid graph RAG.
+- [x] **Phase 4 — Query Router & Hybrid Retrieval:** Confidence-aware intent routing, entity-linked graph retrieval, path-to-prose conversion, labeled context assembly, and JSONL query telemetry.
+- [x] **Phase 5 — Citation Validator & Answer Generation:** Require every factual sentence to cite a retrieved chunk ID, validate citations and regenerate up to two times, with Ollama-first optional Claude/OpenAI fallback.
 - [ ] **Phase 6 — Guardrails & Safety:** Citation verification and anti-hallucination validation.
+
+Phase 4 appends one JSON record per completed question to `logs/retrieval.jsonl` with its route, confidence, latency, and answer. Set `ROUTE_CONFIDENCE_THRESHOLD` (default `0.65`) in `.env` to control when uncertain classifications fall back to both retrieval paths.
+
+Phase 5 records citation validity, generation attempts, retry count, retry rate, cited and invalid chunk IDs, uncited claim count, and generation provider in the same JSONL log. Citations use `[chunk_id: N]` and are accepted only when `N` belongs to the retrieved evidence set. If generated text fails citation checks twice, the app shows up to three sentences copied from retrieved evidence with verified citations. If there is no retrieved evidence, it abstains rather than presenting an unverified answer.
+
+Ollama is used first for answer generation. Set `LLM_FALLBACK_ENABLED=true` and `LLM_FALLBACK_PROVIDER=anthropic` or `openai` to use that cloud provider when Ollama invocation fails. Citation-format failures instead trigger regeneration and then the verified-source fallback.
+
+### Manual Retrieval Check
+
+1. Start PostgreSQL, Neo4j, and Ollama. PgAdmin is optional; it is a database client, not the PostgreSQL server.
+2. Launch the app with `streamlit run main.py`, then ingest a document that contains the facts you want to ask about. Graph extraction should be enabled for relationship questions.
+3. Ask a definition question and a relationship question from that document. Check the route, answer citations, and retrieved evidence in the UI. Questions about facts absent from the ingested documents should not be expected to produce an answer.
+4. Inspect recent routing and citation diagnostics:
+
+```powershell
+Get-Content .\logs\retrieval.jsonl -Tail 5 |
+  ForEach-Object { $_ | ConvertFrom-Json } |
+  Select-Object question, route, confidence, citation_valid,
+    citation_retry_count, citation_ids, invalid_citation_ids,
+    uncited_claim_count, generation_provider |
+  Format-Table -AutoSize
+```
+
+A route confidence of `0.00` means the router response could not be parsed and the request used both retrieval paths as a fallback. High latency or repeated citation retries can indicate the local model is struggling with the requested output format; check the Streamlit terminal and the log fields above.
