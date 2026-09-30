@@ -1,149 +1,231 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from hashlib import sha256
-from io import BytesIO
-from math import sqrt
-
 import streamlit as st
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
-from pypdf import PdfReader
 
+from src.config import settings
+from src.db import postgres, neo4j_conn
+from src.ingestion.embedder import get_embedder
+from src.ingestion.ingest import (
+    ingest_pdf,
+    list_ingested_documents,
+    delete_document,
+)
+from src.graph.writer import get_graph_stats, query_entity_neighborhood
 
-EMBEDDING_MODEL = "nomic-embed-text"
-CHAT_MODEL = "llama3.2:1b"
-CHUNK_WORDS = 180
-CHUNK_OVERLAP = 35
-TOP_K = 5
+# Ensure schemas are ready
+postgres.init_schema()
+neo4j_conn.init_schema()
 
+st.set_page_config(
+    page_title="Knowledge Graph RAG Assistant",
+    page_icon="🕸️",
+    layout="wide",
+)
 
-@dataclass(frozen=True)
-class TextChunk:
-    page_number: int
-    text: str
+st.title("🕸️ Knowledge Graph RAG — Hybrid Retrieval Assistant")
+st.caption(
+    f"Hybrid Backend: PostgreSQL + pgvector (HNSW) & Neo4j Desktop | "
+    f"Ollama: {settings.ollama_chat_model} & {settings.ollama_embed_model}"
+)
 
+# ── Sidebar: Document Library & Graph Health ─────────────────────────────────
+with st.sidebar:
+    st.header("🗂️ Document Library")
+    st.write("Documents stored persistently in PostgreSQL:")
 
-def extract_chunks(pdf_bytes: bytes) -> list[TextChunk]:
-    reader = PdfReader(BytesIO(pdf_bytes))
-    chunks: list[TextChunk] = []
-    step = CHUNK_WORDS - CHUNK_OVERLAP
-
-    for page_number, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
-        words = page_text.split()
-        for start in range(0, len(words), step):
-            text = " ".join(words[start : start + CHUNK_WORDS])
-            if text:
-                chunks.append(TextChunk(page_number=page_number, text=text))
-
-    return chunks
-
-
-def embed_chunks(embeddings_model: OllamaEmbeddings, chunks: list[TextChunk]) -> list[list[float]]:
-    embeddings: list[list[float]] = []
-    for start in range(0, len(chunks), 100):
-        batch = chunks[start : start + 100]
-        embeddings.extend(embeddings_model.embed_documents([chunk.text for chunk in batch]))
-    return embeddings
-
-
-def cosine_similarity(left: list[float], right: list[float]) -> float:
-    dot_product = sum(a * b for a, b in zip(left, right))
-    left_norm = sqrt(sum(value * value for value in left))
-    right_norm = sqrt(sum(value * value for value in right))
-    if not left_norm or not right_norm:
-        return 0.0
-    return dot_product / (left_norm * right_norm)
-
-
-def answer_question(
-    chat_model: ChatOllama,
-    question: str,
-    chunks: list[TextChunk],
-    chunk_embeddings: list[list[float]],
-) -> tuple[str, list[TextChunk]]:
-    question_embedding = OllamaEmbeddings(model=EMBEDDING_MODEL).embed_query(question)
-    ranked = sorted(
-        range(len(chunks)),
-        key=lambda index: cosine_similarity(question_embedding, chunk_embeddings[index]),
-        reverse=True,
-    )
-    sources = [chunks[index] for index in ranked[:TOP_K]]
-    context = "\n\n".join(
-        f"[Page {chunk.page_number}] {chunk.text}" for chunk in sources
-    )
-
-    completion = chat_model.invoke(
-        [
-            SystemMessage(
-                content=(
-                    "Answer the user's question using only the supplied PDF excerpts. "
-                    "If the excerpts do not contain the answer, say so. Cite supporting "
-                    "pages using the format [Page N]."
-                )
-            ),
-            HumanMessage(content=f"PDF excerpts:\n{context}\n\nQuestion: {question}"),
-        ]
-    )
-    answer = str(completion.content) or "I couldn't generate an answer."
-    source_pages = dict.fromkeys(chunk.page_number for chunk in sources)
-    citations = ", ".join(f"[Page {page_number}]" for page_number in source_pages)
-    answer = f"{answer}\n\nSources: {citations}"
-    return answer, sources
-
-
-st.set_page_config(page_title="Ask your PDF")
-st.title("Ask your PDF")
-st.write("Upload a PDF, then ask questions grounded in its contents.")
-st.sidebar.caption(f"Local models: {CHAT_MODEL} and {EMBEDDING_MODEL}")
-
-uploaded_file = st.file_uploader("Choose a PDF", type="pdf")
-
-if uploaded_file is not None:
-    pdf_bytes = uploaded_file.getvalue()
-    current_digest = sha256(pdf_bytes).hexdigest()
-
-    if st.button("Index PDF", type="primary"):
-        try:
-            chunks = extract_chunks(pdf_bytes)
-            if not chunks:
-                st.error("No readable text was found. This app needs a text-based PDF.")
-            else:
-                embeddings = embed_chunks(OllamaEmbeddings(model=EMBEDDING_MODEL), chunks)
-                st.session_state["pdf_index"] = {
-                    "digest": current_digest,
-                    "chunks": chunks,
-                    "embeddings": embeddings,
-                }
-                st.success(f"Indexed {len(chunks)} text chunks. Ask away.")
-        except Exception as error:
-            st.error(
-                f"Could not index this PDF: {error}. Check that Ollama is running "
-                f"and that {EMBEDDING_MODEL} is installed."
-            )
-
-    index = st.session_state.get("pdf_index")
-    if index and index["digest"] == current_digest:
-        question = st.text_input("Your question")
-        if st.button("Get answer", disabled=not question.strip()):
-            try:
-                answer, sources = answer_question(
-                    ChatOllama(model=CHAT_MODEL, temperature=0),
-                    question.strip(),
-                    index["chunks"],
-                    index["embeddings"],
-                )
-                st.subheader("Answer")
-                st.write(answer)
-                with st.expander("Retrieved passages"):
-                    for chunk in sources:
-                        st.markdown(f"**Page {chunk.page_number}**")
-                        st.write(chunk.text)
-            except Exception as error:
-                st.error(
-                    f"Could not answer this question: {error}. Check that Ollama is "
-                    f"running and that {CHAT_MODEL} is installed."
-                )
+    docs = list_ingested_documents()
+    if not docs:
+        st.info("No documents ingested yet. Upload PDFs to get started.")
     else:
-        st.info("Index this PDF to start asking questions.")
+        for doc in docs:
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"**{doc['filename']}**")
+                st.caption(f"ID: {doc['id']} | {doc['chunk_count']} chunks | {str(doc['ingested_at'])[:10]}")
+            with col2:
+                if st.button("🗑️", key=f"del_{doc['id']}", help="Delete document & graph nodes"):
+                    delete_document(doc["id"])
+                    st.rerun()
+
+    st.divider()
+    st.header("📊 Knowledge Graph Stats")
+    g_stats = get_graph_stats()
+    if "error" in g_stats:
+        st.warning(f"Neo4j: {g_stats['error']}")
+    else:
+        st.metric("Graph Entities", g_stats.get("node_count", 0))
+        st.metric("Graph Relationships", g_stats.get("edge_count", 0))
+
+    st.divider()
+    st.subheader("⚙️ Settings")
+    st.text(f"Vector Dim: {settings.embedding_dim}")
+    st.text(f"Top-K: {settings.top_k}")
+    st.text(f"Chunk Words: {settings.chunk_words}")
+
+# ── Main Content Area ───────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(["💬 Ask Questions", "📤 Upload & Ingest Documents", "🕸️ Knowledge Graph Explorer"])
+
+with tab2:
+    st.subheader("Upload PDFs to Knowledge Base")
+    uploaded_files = st.file_uploader(
+        "Select one or more PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
+
+    col_force, col_graph = st.columns(2)
+    with col_force:
+        force_reingest = st.checkbox("Force re-ingest (overwrite existing chunks)", value=False)
+    with col_graph:
+        build_kg = st.checkbox("Extract Knowledge Graph (Neo4j Entities & Triples)", value=True)
+
+    if uploaded_files and st.button("Ingest Documents", type="primary"):
+        progress_bar = st.progress(0)
+        status_box = st.container()
+
+        for idx, file in enumerate(uploaded_files):
+            pdf_bytes = file.getvalue()
+            with status_box:
+                st.write(f"Processing **{file.name}**...")
+                res = ingest_pdf(
+                    pdf_bytes,
+                    filename=file.name,
+                    force=force_reingest,
+                    build_graph=build_kg,
+                )
+                if res.status == "ingested":
+                    st.success(f"✅ {file.name}: {res.message}")
+                elif res.status == "skipped":
+                    st.info(f"⏭️ {file.name}: {res.message}")
+                else:
+                    st.error(f"❌ {file.name}: {res.message}")
+
+            progress_bar.progress((idx + 1) / len(uploaded_files))
+
+        st.success("All uploads processed!")
+        st.rerun()
+
+with tab3:
+    st.subheader("🕸️ Neo4j Knowledge Graph Visualizer & Inspector")
+    stats = get_graph_stats()
+
+    if "error" in stats:
+        st.error(f"Cannot connect to Neo4j: {stats['error']}")
+    else:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Entity Nodes", stats.get("node_count", 0))
+        with col2:
+            st.metric("Total Relations", stats.get("edge_count", 0))
+        with col3:
+            st.metric("Ontology Types Present", len(stats.get("type_breakdown", {})))
+
+        st.markdown("### Entity Types Breakdown")
+        breakdown = stats.get("type_breakdown", {})
+        if breakdown:
+            st.bar_chart(breakdown)
+
+        st.divider()
+        st.markdown("### Explore Entity Neighborhood")
+        top_ents = [e["name"] for e in stats.get("top_entities", [])]
+        search_target = st.text_input(
+            "Search an entity name (or pick a top connected entity):",
+            value=top_ents[0] if top_ents else "",
+        )
+
+        if search_target.strip():
+            triples = query_entity_neighborhood(search_target.strip())
+            if not triples:
+                st.info(f"No direct graph connections found for '{search_target}'.")
+            else:
+                st.write(f"Found **{len(triples)}** connections for **{search_target}**:")
+                table_data = [
+                    {
+                        "Source Entity": t["source"],
+                        "Source Type": t["source_type"],
+                        "Relationship": f"-[ {t['relation']} ]->",
+                        "Target Entity": t["target"],
+                        "Target Type": t["target_type"],
+                        "Provenance (Chunk ID)": t["source_chunk_id"],
+                    }
+                    for t in triples
+                ]
+                st.dataframe(table_data, use_container_width=True)
+
+with tab1:
+    docs = list_ingested_documents()
+    if not docs:
+        st.warning("Please upload and ingest at least one PDF in the 'Upload & Ingest' tab first.")
+    else:
+        doc_options = {d["id"]: f"{d['filename']} ({d['chunk_count']} chunks)" for d in docs}
+        selected_doc_ids = st.multiselect(
+            "Filter search to specific documents (leave empty to search all):",
+            options=list(doc_options.keys()),
+            format_func=lambda x: doc_options[x],
+        )
+
+        question = st.text_input(
+            "Enter your question:",
+            placeholder="e.g. What are the key findings, entities, or connections discussed?",
+        )
+
+        if st.button("Search & Answer", type="primary", disabled=not question.strip()):
+            with st.spinner("Embedding query and searching pgvector..."):
+                embedder = get_embedder()
+                query_embedding = embedder.embed_query(question.strip())
+
+                # Vector search using HNSW cosine index
+                filter_ids = selected_doc_ids if selected_doc_ids else None
+                matches = postgres.vector_search(
+                    query_embedding=query_embedding,
+                    top_k=settings.top_k,
+                    doc_ids=filter_ids,
+                )
+
+            if not matches:
+                st.warning("No relevant passages found in the knowledge base.")
+            else:
+                passages = []
+                for m in matches:
+                    doc_name = next((d["filename"] for d in docs if d["id"] == m["doc_id"]), f"Doc #{m['doc_id']}")
+                    passages.append(
+                        f"[{doc_name} | Page {m['page_number']} | Chunk {m['chunk_index']}]:\n{m['text']}"
+                    )
+                context_str = "\n\n---\n\n".join(passages)
+
+                with st.spinner("Generating answer with Ollama..."):
+                    try:
+                        chat_model = ChatOllama(
+                            base_url=settings.ollama_base_url,
+                            model=settings.ollama_chat_model,
+                            temperature=0,
+                        )
+                        completion = chat_model.invoke(
+                            [
+                                SystemMessage(
+                                    content=(
+                                        "You are an expert AI knowledge assistant. Answer the user's question "
+                                        "strictly using the provided excerpts. Cite source documents and pages "
+                                        "using the format [Filename, Page N]. If the passages do not contain "
+                                        "the information, clearly state that."
+                                    )
+                                ),
+                                HumanMessage(content=f"Context Passages:\n{context_str}\n\nQuestion: {question}"),
+                            ]
+                        )
+                        answer = str(completion.content)
+                    except Exception as err:
+                        answer = f"Error querying LLM: {err}"
+
+                st.subheader("💡 Answer")
+                st.write(answer)
+
+                st.subheader("🔍 Retrieved Passages (pgvector HNSW)")
+                for idx, m in enumerate(matches, 1):
+                    doc_name = next((d["filename"] for d in docs if d["id"] == m["doc_id"]), f"Doc #{m['doc_id']}")
+                    score_pct = round(float(m["score"]) * 100, 1)
+                    with st.expander(f"#{idx} | {doc_name} (Page {m['page_number']}) — Similarity: {score_pct}%"):
+                        st.markdown(f"**Chunk Index:** {m['chunk_index']} | **Doc ID:** {m['doc_id']}")
+                        st.write(m["text"])

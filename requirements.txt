@@ -1,3 +1,19 @@
+# ── Core (original) ───────────────────────────────────────────────────────────
 langchain-ollama>=0.2.0
 pypdf>=5.0.0
 streamlit>=1.38.0
+
+# ── Phase 1: databases ────────────────────────────────────────────────────────
+psycopg2-binary>=2.9.0      # PostgreSQL driver
+pgvector>=0.3.0             # pgvector Python client (type adapters for psycopg2)
+neo4j>=5.0                  # Neo4j bolt driver
+
+# ── Phase 1: LLM providers ────────────────────────────────────────────────────
+anthropic>=0.20.0           # Claude API
+openai>=1.0.0               # OpenAI API
+python-dotenv>=1.0.0        # .env loading
+
+# ── Phase 1: LangChain integrations ──────────────────────────────────────────
+langchain-community>=0.3
+langchain-anthropic>=0.3
+langchain-openai>=0.3
