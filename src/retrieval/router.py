@@ -12,6 +12,7 @@ from typing import Any
 
 from src.config import settings
 from src.generation.generator import GenerationResult, generate_answer
+from src.guardrails.guardrails import GuardrailsResult, run_guardrails
 from src.retrieval import assembler, graph_search, vector_search
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,7 @@ def _log_completed_query(
     elapsed_ms: float,
     answer: str,
     generation: GenerationResult,
+    guardrails: GuardrailsResult | None = None,
 ) -> None:
     """Append one JSONL record per completed query for later evaluation."""
     record = {
@@ -109,6 +111,16 @@ def _log_completed_query(
         "invalid_citation_ids": list(generation.invalid_ids),
         "uncited_claim_count": generation.uncited_claim_count,
         "generation_provider": generation.provider,
+        # ── Phase 6 guardrail signals ────────────────────────────────────────
+        "guardrails_enabled": settings.guardrails_enabled,
+        "guardrails_blocked": guardrails.blocked if guardrails else False,
+        "guardrails_block_reason": guardrails.topic_guard.reason if guardrails and guardrails.blocked else None,
+        "guardrails_block_category": guardrails.topic_guard.category if guardrails and guardrails.blocked else None,
+        "groundedness_score": guardrails.groundedness.mean_score if guardrails and guardrails.groundedness else None,
+        "grounded": guardrails.grounded if guardrails else None,
+        "ungrounded_sentence_count": len(guardrails.groundedness.ungrounded_sentences) if guardrails and guardrails.groundedness else 0,
+        "pii_scrubbed": guardrails.pii_scrubbed if guardrails else False,
+        "pii_types_found": list(guardrails.scrub.types_found) if guardrails and guardrails.scrub and guardrails.scrub.scrubbed else [],
     }
     logger.info("retrieval_decision %s", json.dumps(record, ensure_ascii=True))
     log_path = Path(__file__).resolve().parents[2] / "logs" / "retrieval.jsonl"
@@ -129,6 +141,35 @@ def retrieve_and_answer(
 ) -> dict:
     """Route, retrieve, assemble evidence, answer, and persist query telemetry."""
     started = time.perf_counter()
+
+    # ── Phase 6: Pre-retrieval topic guard ──────────────────────────────────
+    pre_guard = run_guardrails(question, answer=None)
+    if pre_guard.blocked:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        # Build a dummy generation result so the log schema stays consistent
+        from src.generation.generator import GenerationResult
+        dummy_gen = GenerationResult(
+            answer=pre_guard.answer,
+            attempts=0,
+            retries=0,
+            valid=True,
+            citation_ids=(),
+            invalid_ids=(),
+            provider="guardrails",
+        )
+        dummy_decision = RouteDecision(RetrievalRoute.BOTH, 0.0, True)
+        _log_completed_query(question, dummy_decision, elapsed_ms, pre_guard.answer, dummy_gen, pre_guard)
+        return {
+            "answer": pre_guard.answer,
+            "decision": dummy_decision,
+            "latency_ms": elapsed_ms,
+            "vector_results": [],
+            "graph_results": [],
+            "context": "",
+            "generation": dummy_gen,
+            "guardrails": pre_guard,
+        }
+
     model = llm
     decision = RouteDecision(RetrievalRoute.BOTH, 0.0, True)
     vector_results: list[dict] = []
@@ -169,10 +210,18 @@ def retrieve_and_answer(
         retrieved_chunk_ids,
         llm=llm,
     )
-    answer = generation.answer
+
+    # ── Phase 6: Post-generation guardrails (groundedness + PII scrubber) ───
+    guardrails_result = run_guardrails(
+        question,
+        answer=generation.answer,
+        context=context,
+        retrieved_chunk_ids=list(retrieved_chunk_ids),
+    )
+    answer = guardrails_result.answer
 
     elapsed_ms = (time.perf_counter() - started) * 1000
-    _log_completed_query(question, decision, elapsed_ms, answer, generation)
+    _log_completed_query(question, decision, elapsed_ms, answer, generation, guardrails_result)
     return {
         "answer": answer,
         "decision": decision,
@@ -181,4 +230,5 @@ def retrieve_and_answer(
         "graph_results": graph_results,
         "context": context,
         "generation": generation,
+        "guardrails": guardrails_result,
     }

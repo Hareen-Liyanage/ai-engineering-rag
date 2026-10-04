@@ -59,6 +59,16 @@ class Settings:
         default_factory=lambda: float(os.getenv("ROUTE_CONFIDENCE_THRESHOLD", "0.65"))
     )
 
+    # ── Guardrails (Phase 6) ─────────────────────────────────────────────────
+    guardrails_enabled: bool = field(
+        default_factory=lambda: os.getenv("GUARDRAILS_ENABLED", "true").lower() in {"1", "true", "yes"}
+    )
+    # Minimum fraction of claim tokens that must appear in the cited chunk text
+    # for a sentence to be considered grounded.  Range: 0.0 – 1.0.
+    groundedness_min_overlap: float = field(
+        default_factory=lambda: float(os.getenv("GROUNDEDNESS_MIN_OVERLAP", "0.25"))
+    )
+
     @property
     def pg_dsn(self) -> str:
         return (

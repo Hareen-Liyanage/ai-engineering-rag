@@ -179,15 +179,42 @@ with tab1:
 
             decision = result["decision"]
             fallback_label = " (low-confidence fallback)" if decision.fallback else ""
-            st.caption(
-                f"Route: {decision.route.value} | Confidence: {decision.confidence:.2f}"
-                f"{fallback_label} | {result['latency_ms']:.0f} ms | "
-                f"Citation retries: {result['generation'].retries}"
-            )
-            st.subheader("💡 Answer")
-            if result["generation"].extractive_fallback:
-                st.info("The generated answer failed citation checks. Showing verified source text instead.")
-            st.write(result["answer"])
+            guardrails = result.get("guardrails")
+
+            # ── Guardrail block banner ─────────────────────────────────────
+            if guardrails and guardrails.blocked:
+                st.error(
+                    f"🛡️ **Request blocked by guardrails** "
+                    f"({guardrails.topic_guard.category})\n\n"
+                    f"{guardrails.topic_guard.reason}"
+                )
+            else:
+                # Build guardrail detail string for caption
+                guard_parts = []
+                if guardrails and guardrails.groundedness is not None:
+                    score_pct = round(guardrails.groundedness.mean_score * 100, 1)
+                    grounded_label = "✅ grounded" if guardrails.grounded else "⚠️ ungrounded"
+                    guard_parts.append(f"Groundedness: {score_pct}% ({grounded_label})")
+                if guardrails and guardrails.pii_scrubbed:
+                    guard_parts.append("🔒 PII scrubbed")
+                guard_str = " | ".join(guard_parts)
+
+                st.caption(
+                    f"Route: {decision.route.value} | Confidence: {decision.confidence:.2f}"
+                    f"{fallback_label} | {result['latency_ms']:.0f} ms | "
+                    f"Citation retries: {result['generation'].retries}"
+                    + (f" | {guard_str}" if guard_str else "")
+                )
+                st.subheader("💡 Answer")
+                if result["generation"].extractive_fallback:
+                    st.info("The generated answer failed citation checks. Showing verified source text instead.")
+                if guardrails and not guardrails.grounded and guardrails.groundedness:
+                    st.warning(
+                        f"⚠️ Groundedness check flagged "
+                        f"{len(guardrails.groundedness.ungrounded_sentences)} sentence(s) "
+                        "as potentially not supported by the retrieved evidence."
+                    )
+                st.write(result["answer"])
 
             vector_matches = result["vector_results"]
             graph_matches = result["graph_results"]
