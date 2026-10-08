@@ -21,7 +21,11 @@ from typing import Generator, Sequence
 
 import psycopg2
 import psycopg2.extras
-from pgvector.psycopg2 import register_vector
+
+try:
+    from pgvector.psycopg2 import register_vector
+except ImportError:  # pragma: no cover - exercised only without pgvector installed
+    register_vector = None  # type: ignore[assignment]
 
 from src.config import settings
 
@@ -72,10 +76,11 @@ def _make_connection() -> psycopg2.extensions.connection:
         password=settings.pg_password,
         dbname=settings.pg_database,
     )
-    # register_vector must be called outside a transaction (i.e. in autocommit mode)
-    conn.autocommit = True
-    register_vector(conn)
-    conn.autocommit = False
+    if register_vector is not None:
+        # register_vector must be called outside a transaction (i.e. in autocommit mode)
+        conn.autocommit = True
+        register_vector(conn)
+        conn.autocommit = False
     return conn
 
 

@@ -59,6 +59,14 @@ class Phase4Tests(unittest.TestCase):
         self.assertIn("$limit", GRAPH_QUERY_TEMPLATES["relationships"])
         self.assertIn("$node_ids", GRAPH_QUERY_TEMPLATES["manages"])
 
+    def test_multi_hop_template_is_bounded_and_parameterized(self):
+        template = GRAPH_QUERY_TEMPLATES["multi_hop"]
+        self.assertIn("[*1..$max_hops]", template)
+        self.assertIn("$node_ids", template)
+        self.assertIn("$doc_ids", template)
+        self.assertIn("$limit", template)
+        self.assertIn("relationships(path)", template)
+
     def test_graph_triples_become_deduplicated_prose(self):
         triple = {
             "source": "Alice",

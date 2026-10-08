@@ -41,6 +41,21 @@ GRAPH_QUERY_TEMPLATES = {
         ORDER BY r.confidence DESC
         LIMIT $limit
     """,
+    "multi_hop": """
+        MATCH path = (start:Entity)-[*1..$max_hops]->(end:Entity)
+        WHERE (elementId(start) IN $node_ids OR elementId(end) IN $node_ids)
+          AND all(type(rel) <> 'MENTIONS' FOR rel IN relationships(path))
+          AND ($doc_ids IS NULL OR all(rel.doc_id IN $doc_ids FOR rel IN relationships(path)))
+        UNWIND range(0, length(nodes(path)) - 2) AS index
+        WITH path, index, nodes(path)[index] AS source, relationships(path)[index] AS rel,
+             nodes(path)[index + 1] AS target
+        RETURN source.canonical_name AS source, source.entity_type AS source_type,
+               type(rel) AS relation, target.canonical_name AS target,
+               target.entity_type AS target_type, rel.source_chunk_id AS source_chunk_id,
+               rel.doc_id AS doc_id
+        ORDER BY rel.confidence DESC
+        LIMIT $limit
+    """,
 }
 
 
@@ -73,11 +88,15 @@ def search(
     top_k: int | None = None,
     llm: Any | None = None,
     driver: Any | None = None,
+    max_hops: int = 3,
 ) -> list[dict]:
-    """Extract entities, resolve Neo4j element IDs, and query related triples."""
+    """Extract entities, resolve Neo4j element IDs, and query bounded graph paths."""
     entity_names = extract_question_entities(question, llm=llm)
     if not entity_names:
         return []
+
+    from src.db.neo4j_conn import get_driver
+
     driver = driver or get_driver()
     if driver is None:
         return []
@@ -97,13 +116,14 @@ def search(
             if not node_ids:
                 return []
 
-            template_name = "manages" if re.search(r"\bmanage[sd]?\b", question, re.IGNORECASE) else "relationships"
+            template_name = "manages" if re.search(r"\bmanage[sd]?\b", question, re.IGNORECASE) else "multi_hop"
             records = session.run(
                 GRAPH_QUERY_TEMPLATES[template_name],
                 {
                     "node_ids": node_ids,
                     "doc_ids": doc_ids or None,
                     "limit": top_k or 10,
+                    "max_hops": max(1, min(3, max_hops)),
                 },
             )
             return [dict(record) for record in records]

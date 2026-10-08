@@ -15,19 +15,21 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import Generator
+from typing import Any, Generator
 
-from neo4j import GraphDatabase, Driver
-from neo4j.exceptions import ServiceUnavailable
+try:
+    from neo4j import GraphDatabase
+except ImportError:  # pragma: no cover - exercised only when the optional driver is absent
+    GraphDatabase = None  # type: ignore[assignment]
 
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-_driver: Driver | None = None
+_driver: Any | None = None
 
 
-def get_driver() -> Driver | None:
+def get_driver() -> Any | None:
     """
     Return the Neo4j driver singleton, or None if the server is unreachable.
     Callers must handle None gracefully (graph path disabled).
@@ -35,6 +37,9 @@ def get_driver() -> Driver | None:
     global _driver
     if _driver is not None:
         return _driver
+    if GraphDatabase is None:
+        logger.warning("Neo4j Python driver is not installed; graph retrieval is disabled.")
+        return None
     auth = (settings.neo4j_user, settings.neo4j_password) if settings.neo4j_password else None
     for attempt_auth in [auth, None]:
         try:
